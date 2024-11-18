@@ -23,7 +23,7 @@ type request struct { // 请求信息
 	arg, reply reflect.Value
 }
 
-var DefaultOption = Option{
+var DefaultOption = &Option{
 	MarkNumber: FLAG_NUMBER,
 	CodecType:  codec.GOB, // 默认使用GOB编码
 }
@@ -47,10 +47,9 @@ var (
 )
 
 func (server *Server) serveCodec(f codec.Codec) {
-	defer f.Close()
 	// 加锁确保发送完整的消息
 	mutex := &sync.Mutex{}
-	var wg sync.WaitGroup
+	wg := &sync.WaitGroup{}
 
 	// 读取，处理，发送
 	for {
@@ -64,9 +63,10 @@ func (server *Server) serveCodec(f codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(f, req, mutex, &wg)
+		go server.handleRequest(f, req, mutex, wg)
 	}
 	wg.Wait()
+	_ = f.Close()
 }
 
 func (server *Server) ServeConn(conn io.ReadWriteCloser) {
@@ -146,3 +146,5 @@ func (server *Server) handleRequest(f codec.Codec, req *request, mutex *sync.Mut
 	req.reply = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.ID))
 	server.sendResponse(f, req.h, req.reply.Interface(), mutex)
 }
+
+func Accrpt(lis net.Listener) { DefaultServer.Accept(lis) }
