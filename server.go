@@ -3,30 +3,16 @@ package microrpc
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
 	"io"
 	"log"
 	"microrpc/codec"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
-
-const FLAG_NUMBER = 0x3bf1bd
-
-type Option struct { // 选项信息
-	MarkNumber int        // 标记号
-	CodecType  codec.Type // 编码方式
-}
-
-type request struct { // 请求信息
-	h          *codec.Header
-	arg, reply reflect.Value
-}
-
-var DefaultOption = &Option{
-	MarkNumber: FLAG_NUMBER,
-	CodecType:  codec.GOB, // 默认使用GOB编码
-}
 
 /*
 micro-rpc采用的协议格式
@@ -35,16 +21,54 @@ micro-rpc采用的协议格式
 | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定   ------->|
 */
 
-type Server struct{}
+const FLAG_NUMBER = 0x3bf1bd
+
+var (
+	DefaultOption = &Option{
+		MarkNumber: FLAG_NUMBER,
+		CodecType:  codec.GOB, // 默认使用GOB编码
+	}
+	DefaultServer  = NewServer()
+	invalidRequest = struct{}{}
+)
+
+// 选项信息
+type Option struct {
+	MarkNumber int        // 标记号
+	CodecType  codec.Type // 编码方式
+}
+
+// 请求信息
+type request struct {
+	h          *codec.Header
+	arg, reply reflect.Value
+	mtype      *methodType
+	svc        *service
+}
+
+// 服务信息
+type Server struct {
+	services sync.Map // 服务列表
+}
 
 func NewServer() *Server {
 	return &Server{}
 }
 
-var (
-	DefaultServer  = NewServer()
-	invalidRequest = struct{}{}
-)
+func (server *Server) Register(reveiver interface{}) error {
+	s := newService(reveiver)
+	if _, loaded := server.services.LoadOrStore(s.name, s); loaded {
+		return fmt.Errorf("rpc server : service %s already registered", s.name)
+	}
+	return nil
+}
+func Accept(lis net.Listener) {
+	DefaultServer.Accept(lis)
+}
+
+func Register(receiver interface{}) error {
+	return DefaultServer.Register(receiver)
+}
 
 func (server *Server) serveCodec(f codec.Codec) {
 	// 加锁确保发送完整的消息
@@ -103,10 +127,6 @@ func (server *Server) Accept(lis net.Listener) {
 	}
 }
 
-func Accept(lis net.Listener) {
-	DefaultServer.Accept(lis)
-}
-
 func (server *Server) readRequestHeader(f codec.Codec) (*codec.Header, error) {
 	h := codec.Header{}
 	if err := f.ReadHeader(&h); err != nil {
@@ -123,11 +143,24 @@ func (server *Server) readRequest(f codec.Codec) (*request, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 先暂时认为他就是个字符串，后续完善
+
 	req := &request{h: h}
-	req.arg = reflect.New(reflect.TypeOf(""))
-	if err = f.ReadBody(req.arg.Interface()); err != nil {
-		log.Println("rpc server: read arg err:", err)
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+
+	req.arg = req.mtype.newArgv()
+	req.reply = req.mtype.newReplyv()
+
+	argvi := req.arg.Interface()
+	// 确保是指针类型
+	if req.arg.Type().Kind() != reflect.Ptr {
+		argvi = req.arg.Addr().Interface()
+	}
+	if err := f.ReadBody(argvi); err != nil {
+		log.Printf("rpc server : read body error:%v\n", err)
+		return req, err
 	}
 	return req, nil
 }
@@ -142,9 +175,125 @@ func (server *Server) sendResponse(f codec.Codec, h *codec.Header, body interfac
 
 func (server *Server) handleRequest(f codec.Codec, req *request, mutex *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println(req.h, req.arg.Elem())
-	req.reply = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.ID))
+
+	if err := req.svc.call(req.mtype, req.arg, req.reply); err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(f, req.h, invalidRequest, mutex)
+		return
+	}
+
 	server.sendResponse(f, req.h, req.reply.Interface(), mutex)
 }
 
-func Accrpt(lis net.Listener) { DefaultServer.Accept(lis) }
+func (server *Server) findService(serviceMethod string) (*service, *methodType, error) {
+	args := strings.Split(serviceMethod, ".")
+	if len(args) != 2 {
+		return nil, nil, fmt.Errorf("rpc server : invalid service method %s", serviceMethod)
+	}
+	serviceName, methodName := args[0], args[1]
+	s, ok := server.services.Load(serviceName)
+	if !ok {
+		return nil, nil, fmt.Errorf("rpc server : service %s.%s not found", serviceName, methodName)
+	}
+	svc := s.(*service)
+	mtype := svc.method[methodName]
+	if mtype == nil {
+		return nil, nil, fmt.Errorf("rpc server : method %s not found in service %s", methodName, serviceName)
+	}
+	return svc, mtype, nil
+}
+
+// 通过反射实现注册service
+
+type methodType struct {
+	method    reflect.Method
+	ArgType   reflect.Type
+	ReplyType reflect.Type
+	numCalls  uint64
+}
+
+func (m *methodType) NumCalls() uint64 {
+	return atomic.LoadUint64(&m.numCalls)
+}
+
+func (m *methodType) newArgv() (argv reflect.Value) {
+	if m.ArgType.Kind() == reflect.Ptr {
+		argv = reflect.New(m.ArgType.Elem())
+	} else {
+		argv = reflect.New(m.ArgType).Elem()
+	}
+	return
+}
+
+func (m *methodType) newReplyv() reflect.Value {
+	replyv := reflect.New(m.ReplyType.Elem())
+	switch m.ReplyType.Elem().Kind() {
+	case reflect.Map:
+		replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
+	case reflect.Slice:
+		replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
+	}
+	return replyv
+}
+
+type service struct {
+	name     string
+	typ      reflect.Type
+	method   map[string]*methodType
+	receiver reflect.Value
+}
+
+func newService(receiver interface{}) *service {
+	s := &service{
+		name:     reflect.Indirect(reflect.ValueOf(receiver)).Type().Name(),
+		typ:      reflect.TypeOf(receiver),
+		receiver: reflect.ValueOf(receiver),
+	}
+	if !ast.IsExported(s.name) {
+		log.Fatalf("rpc server : service %s is invalid name\n", s.name)
+	}
+
+	s.registerMethods()
+
+	return s
+}
+
+func isValidType(t reflect.Type) bool {
+	return ast.IsExported(t.Name()) || t.PkgPath() == ""
+}
+
+func (s *service) registerMethods() {
+	s.method = make(map[string]*methodType)
+	for i := 0; i < s.typ.NumMethod(); i++ {
+		method := s.typ.Method(i)
+		mType := method.Type
+		// 根据rpc函数的定义，入参第一个参数是参数，第二个参数是返回值
+		// 但是由于反射的原因，自身会作为第零个参数，类似于this和self
+		// 出参只有一个error
+		if mType.NumIn() != 3 || mType.NumOut() != 1 {
+			continue
+		}
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+		argType, replyType := mType.In(1), mType.In(2)
+		if !isValidType(argType) || !isValidType(replyType) {
+			continue
+		}
+		s.method[method.Name] = &methodType{
+			method:    method,
+			ArgType:   argType,
+			ReplyType: replyType,
+		}
+		log.Printf("rpc server : register method %s.%s\n", s.name, method.Name)
+	}
+}
+
+func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
+	atomic.AddUint64(&m.numCalls, 1)
+	retValue := m.method.Func.Call([]reflect.Value{s.receiver, argv, replyv})
+	if err := retValue[0].Interface(); err != nil {
+		return err.(error)
+	}
+	return nil
+}
