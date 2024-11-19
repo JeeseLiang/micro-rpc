@@ -1,6 +1,7 @@
 package microrpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"microrpc/codec"
 	"net"
 	"sync"
+	"time"
 )
 
 type Call struct {
@@ -179,7 +181,7 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 		return nil, err
 	}
 
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +193,23 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 		}
 	}()
 
-	return NewClient(conn, opt)
+	// 超时处理
+	ch := make(chan *Client)
+	go func() {
+		client, err = NewClient(conn, opt)
+		ch <- client
+	}()
+
+	if opt.ConnectTimeout == 0 {
+		client = <-ch
+		return
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case client = <-ch:
+		return
+	}
 }
 
 func (c *Client) send(call *Call) {
@@ -242,7 +260,14 @@ func (c *Client) Go(serviceMethod string, args, reply interface{}, done chan *Ca
 	return call
 }
 
-func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := c.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	// 将Call的超时处理控制权交给用户
+	select {
+	case <-ctx.Done():
+		c.RemoveCall(call.ID)
+		return errors.New("rpc client: call canceled" + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }

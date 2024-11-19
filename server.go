@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 /*
@@ -25,8 +26,9 @@ const FLAG_NUMBER = 0x3bf1bd
 
 var (
 	DefaultOption = &Option{
-		MarkNumber: FLAG_NUMBER,
-		CodecType:  codec.GOB, // 默认使用GOB编码
+		MarkNumber:     FLAG_NUMBER,
+		CodecType:      codec.GOB,        // 默认使用GOB编码
+		ConnectTimeout: time.Second * 10, // 默认连接超时时间
 	}
 	DefaultServer  = NewServer()
 	invalidRequest = struct{}{}
@@ -34,8 +36,10 @@ var (
 
 // 选项信息
 type Option struct {
-	MarkNumber int        // 标记号
-	CodecType  codec.Type // 编码方式
+	MarkNumber     int           // 标记号
+	CodecType      codec.Type    // 编码方式
+	ConnectTimeout time.Duration // 连接超时时间
+	HandleTimeout  time.Duration // 处理超时时间
 }
 
 // 请求信息
@@ -70,7 +74,7 @@ func Register(receiver interface{}) error {
 	return DefaultServer.Register(receiver)
 }
 
-func (server *Server) serveCodec(f codec.Codec) {
+func (server *Server) serveCodec(f codec.Codec, opt *Option) {
 	// 加锁确保发送完整的消息
 	mutex := &sync.Mutex{}
 	wg := &sync.WaitGroup{}
@@ -87,7 +91,7 @@ func (server *Server) serveCodec(f codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(f, req, mutex, wg)
+		go server.handleRequest(f, req, mutex, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = f.Close()
@@ -113,7 +117,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		return
 	}
 
-	server.serveCodec(f(conn))
+	server.serveCodec(f(conn), &opt)
 }
 
 func (server *Server) Accept(lis net.Listener) {
@@ -173,16 +177,41 @@ func (server *Server) sendResponse(f codec.Codec, h *codec.Header, body interfac
 	}
 }
 
-func (server *Server) handleRequest(f codec.Codec, req *request, mutex *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(f codec.Codec, req *request, mutex *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
 
-	if err := req.svc.call(req.mtype, req.arg, req.reply); err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(f, req.h, invalidRequest, mutex)
+	sent := make(chan struct{})
+	var once sync.Once
+
+	go func() {
+		err := req.svc.call(req.mtype, req.arg, req.reply)
+		if err != nil {
+			req.h.Error = err.Error()
+			once.Do(func() {
+				server.sendResponse(f, req.h, invalidRequest, mutex)
+				sent <- struct{}{}
+			})
+		}
+		once.Do(func() {
+			server.sendResponse(f, req.h, req.reply.Interface(), mutex)
+			sent <- struct{}{}
+		})
+	}()
+
+	if timeout == 0 {
+		<-sent
 		return
 	}
 
-	server.sendResponse(f, req.h, req.reply.Interface(), mutex)
+	select {
+	case <-time.After(timeout):
+		once.Do(func() {
+			server.sendResponse(f, req.h, invalidRequest, mutex)
+			sent <- struct{}{}
+		})
+	case <-sent:
+		return
+	}
 }
 
 func (server *Server) findService(serviceMethod string) (*service, *methodType, error) {
