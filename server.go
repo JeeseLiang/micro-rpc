@@ -8,6 +8,7 @@ import (
 	"log"
 	"microrpc/codec"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -22,7 +23,12 @@ micro-rpc采用的协议格式
 | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定   ------->|
 */
 
-const FLAG_NUMBER = 0x3bf1bd
+const (
+	FLAG_NUMBER      = 0x3bf1bd
+	connected        = "200 Connected to MicroRPC"
+	defaultDebugPath = "/debug/_micro_rpc_"
+	defaultRPCPath   = "/_micro_rpc_"
+)
 
 var (
 	DefaultOption = &Option{
@@ -59,6 +65,36 @@ func NewServer() *Server {
 	return &Server{}
 }
 
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Printf("rpc server : hijack error:%v\n", err)
+		return
+	}
+	io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+func ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	DefaultServer.ServeHTTP(w, req)
+}
+
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path: ", defaultDebugPath)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
+
 func (server *Server) Register(reveiver interface{}) error {
 	s := newService(reveiver)
 	if _, loaded := server.services.LoadOrStore(s.name, s); loaded {
@@ -66,6 +102,7 @@ func (server *Server) Register(reveiver interface{}) error {
 	}
 	return nil
 }
+
 func Accept(lis net.Listener) {
 	DefaultServer.Accept(lis)
 }

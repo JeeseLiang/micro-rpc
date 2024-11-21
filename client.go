@@ -1,6 +1,7 @@
 package microrpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"log"
 	"microrpc/codec"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -54,6 +57,35 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 		return nil, err
 	}
 	return newClientCodec(cc, opt)
+}
+
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil {
+		if resp.Status != connected {
+			return nil, errors.New("Unexpected response status: " + resp.Status)
+		}
+		return NewClient(conn, opt)
+	}
+
+	return nil, err
+
+}
+
+func XDial(rpcPath string, opts ...*Option) (client *Client, err error) {
+	argv := strings.Split(rpcPath, "@")
+	if len(argv) != 2 {
+		return nil, errors.New("rpc client: wrong format of rpcPath : " + rpcPath)
+	}
+	protoc, addr := argv[0], argv[1]
+	switch protoc {
+	case "http":
+		return Dial(NewClient, "tcp", addr, opts...)
+	default:
+		return Dial(NewClient, protoc, addr, opts...)
+	}
 }
 
 func newClientCodec(cc codec.Codec, opt *Option) (*Client, error) {
@@ -175,7 +207,11 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+func DialHTTP(network string, address string, opts ...*Option) (client *Client, err error) {
+	return Dial(NewHTTPClient, network, address, opts...)
+}
+
+func Dial(f func(net.Conn, *Option) (*Client, error), network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
@@ -196,7 +232,7 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 	// 超时处理
 	ch := make(chan *Client)
 	go func() {
-		client, err = NewClient(conn, opt)
+		client, err = f(conn, opt)
 		ch <- client
 	}()
 
