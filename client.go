@@ -75,6 +75,7 @@ func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
 }
 
 func XDial(rpcPath string, opts ...*Option) (client *Client, err error) {
+
 	argv := strings.Split(rpcPath, "@")
 	if len(argv) != 2 {
 		return nil, errors.New("rpc client: wrong format of rpcPath : " + rpcPath)
@@ -190,20 +191,19 @@ func (c *Call) DoneCall() {
 }
 
 func parseOptions(opts ...*Option) (*Option, error) {
-	if len(opts) == 0 {
+	if len(opts) == 0 || opts[0] == nil {
 		return DefaultOption, nil
 	}
 	if len(opts) > 1 {
 		return nil, errors.New("too many options")
 	}
-
 	opt := opts[0]
 	// 合并默认选项
 	opt.MarkNumber = DefaultOption.MarkNumber
+
 	if opt.CodecType == "" {
 		opt.CodecType = DefaultOption.CodecType
 	}
-
 	return opt, nil
 }
 
